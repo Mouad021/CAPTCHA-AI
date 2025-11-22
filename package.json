@@ -1,0 +1,12 @@
+{
+  "name": "samurai-relay",
+  "version": "1.0.0",
+  "main": "relay-server.js",
+  "type": "commonjs",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "scripts": {
+    "start": "node relay-server.js"
+  }
+}

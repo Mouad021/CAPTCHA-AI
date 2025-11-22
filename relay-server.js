@@ -1,0 +1,271 @@
+// ==============================
+//  SAMURAI RELAY SERVER (FINAL)
+//  With Full Security + IP Logging
+// ==============================
+
+const WebSocket = require("ws");
+const http = require("http");
+
+// ==============================
+// CONFIG
+// ==============================
+
+// Allowed tokens:
+const TOKEN_LIST = (process.env.TOKEN_LIST || "")
+  .split(",")
+  .map((t) => t.trim())
+  .filter(Boolean);
+
+function tokenAllowed(tok) {
+  return TOKEN_LIST.length === 0 || TOKEN_LIST.includes(tok);
+}
+
+// Paths to block
+const BLOCKED_PATHS = [
+  "/robots.txt",
+  "/favicon.ico",
+  "/sitemap.xml",
+  "/.env",
+  "/.git",
+  "/wp-admin",
+  "/wp-login.php",
+  "/phpmyadmin",
+  "/admin",
+  "/api",
+  "/server-status",
+];
+
+// ==============================
+// Helper functions
+// ==============================
+function getIP(req) {
+  return (
+    (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+    req.socket.remoteAddress ||
+    "unknown"
+  );
+}
+
+// ==============================
+// HTTP SERVER (block everything except WS)
+// ==============================
+const server = http.createServer((req, res) => {
+  const ip = getIP(req);
+
+  console.log(
+    `[HTTP] IP=${ip} → ${req.method} ${req.url} UA="${req.headers[
+      "user-agent"
+    ] || ""}"`
+  );
+
+  const path = req.url.toLowerCase();
+
+  // Block defined paths
+  if (BLOCKED_PATHS.some((p) => path.startsWith(p))) {
+    console.log(`[HTTP-BLOCK] Blocked: ${path} from IP=${ip}`);
+    res.writeHead(403, { "Content-Type": "text/plain" });
+    return res.end("Forbidden");
+  }
+
+  // Block all normal HTTP requests
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  return res.end("Not Found");
+});
+
+// ==============================
+// WEBSOCKET SERVER
+// ==============================
+const wss = new WebSocket.Server({ server });
+
+const rooms = new Map();
+
+function getRoom(token) {
+  if (!rooms.has(token)) {
+    rooms.set(token, { solver: null, clients: new Set() });
+  }
+  return rooms.get(token);
+}
+
+function safeSend(ws, msg) {
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(msg));
+    }
+  } catch (_) {}
+}
+
+// ==============================
+// Log WS handshake (attempts)
+// ==============================
+wss.on("headers", (headers, req) => {
+  const ip = getIP(req);
+  const ua = req.headers["user-agent"] || "";
+
+  console.log(`[WS-HANDSHAKE] IP=${ip} UA="${ua}"`);
+});
+
+// ==============================
+// Handle connections
+// ==============================
+wss.on("connection", (ws, req) => {
+  const ip = getIP(req);
+  ws._ip = ip;
+  ws.meta = { role: null, token: null, id: null };
+
+  console.log(`[WS-CONNECT] IP=${ip}`);
+
+  ws.on("message", (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      console.log(`[WS-MSG-INVALID] From IP=${ip} RAW=${raw.toString()}`);
+      return;
+    }
+
+    console.log(
+      `[WS-MSG] IP=${ip} MSG=${raw.toString().slice(0, 300)}`
+    );
+
+    // First message must be HELLO
+    if (msg.type === "hello") {
+      const { role, token, id } = msg;
+
+      if (!token || !role) {
+        console.log(`[WS-HELLO-ERROR] Missing role/token from IP=${ip}`);
+        return safeSend(ws, { type: "error", error: "missing token/role" });
+      }
+
+      if (!tokenAllowed(token)) {
+        console.log(
+          `[WS-TOKEN-BLOCKED] IP=${ip} BAD_TOKEN="${token}" FULL_MSG=${raw
+            .toString()
+            .slice(0, 300)}`
+        );
+        return safeSend(ws, { type: "error", error: "token not allowed" });
+      }
+
+      ws.meta.role = role;
+      ws.meta.token = token;
+      ws.meta.id = id || Math.random().toString(36).slice(2);
+
+      const room = getRoom(token);
+
+      if (role === "solver") {
+        // Replace old solver
+        if (room.solver && room.solver !== ws) {
+          try {
+            room.solver.close();
+          } catch (_) {}
+        }
+
+        room.solver = ws;
+
+        console.log(`[SOLVER-CONNECT] Solver joined token=${token} IP=${ip}`);
+
+        safeSend(ws, { type: "hello_ok", role: "solver" });
+
+        // notify clients
+        for (const c of room.clients) {
+          safeSend(c, { type: "solver_status", online: true });
+        }
+
+      } else if (role === "client") {
+        room.clients.add(ws);
+        console.log(
+          `[CLIENT-CONNECT] Client joined token=${token} IP=${ip}`
+        );
+
+        safeSend(ws, {
+          type: "hello_ok",
+          role: "client",
+          solverOnline: !!room.solver,
+        });
+
+        safeSend(ws, { type: "solver_status", online: !!room.solver });
+      }
+
+      return;
+    }
+
+    // After HELLO
+    const { role, token, id } = ws.meta;
+    if (!role || !token) {
+      console.log(
+        `[WS-UNAUTHORIZED] IP=${ip} tried to send without HELLO`
+      );
+      return safeSend(ws, { type: "error", error: "not handshaked" });
+    }
+
+    const room = getRoom(token);
+
+    // CLIENT → SOLVER
+    if (role === "client" && (msg.type === "solve" || msg.type === "feedback")) {
+      if (!room.solver) {
+        return safeSend(ws, {
+          type: msg.type + "_result",
+          ok: false,
+          error: "solver offline",
+          reqId: msg.reqId,
+        });
+      }
+
+      safeSend(room.solver, { ...msg, fromClientId: id });
+      return;
+    }
+
+    // SOLVER → CLIENT
+    if (
+      role === "solver" &&
+      (msg.type === "solve_result" || msg.type === "feedback_result")
+    ) {
+      const targetClientId = msg.toClientId;
+
+      for (const c of room.clients) {
+        if (c.meta.id === targetClientId) {
+          safeSend(c, msg);
+          return;
+        }
+      }
+      return;
+    }
+  });
+
+  ws.on("close", () => {
+    const { role, token } = ws.meta;
+    const ip = ws._ip;
+
+    console.log(`[WS-CLOSE] IP=${ip} ROLE=${role || "?"} TOKEN=${token || "?"}`);
+
+    if (!token) return;
+    const room = getRoom(token);
+
+    if (role === "client") room.clients.delete(ws);
+    if (role === "solver" && room.solver === ws) {
+      room.solver = null;
+      for (const c of room.clients) {
+        safeSend(c, { type: "solver_status", online: false });
+      }
+    }
+
+    if (!room.solver && room.clients.size === 0) {
+      rooms.delete(token);
+    }
+  });
+
+  ws.on("error", (err) => {
+    console.log(`[WS-ERROR] IP=${ip} ERR=${err.message}`);
+  });
+});
+
+// ==============================
+// START SERVER
+// ==============================
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+  console.log("======================================");
+  console.log("  SAMURAI RELAY SERVER RUNNING SECURE ");
+  console.log("  PORT =", PORT);
+  console.log("  TOKENS =", TOKEN_LIST);
+  console.log("======================================");
+});
